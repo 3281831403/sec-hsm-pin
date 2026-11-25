@@ -31,8 +31,9 @@ DEFAULT_POLICY = {
     "salt": "hsmpin-default-salt",
 }
 
-# The verification worker keeps a process-wide failure sequence.
-_PROCESS_FAILURE_COUNT = 0
+# Failure counters are stored per device in the supplied state mapping
+# (``state["devices"][device]["failures"]``).  They must never be shared
+# process-wide, otherwise activity on one device leaks into another.
 
 
 def _merge_policy(policy: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -136,16 +137,28 @@ def validate_pin_format(
     if len(pin) < minimum or len(pin) > maximum:
         problems.append("pin_length")
 
-    # Only the length is considered here.
+    allowed = settings.get("allowed_chars")
+    if allowed is not None:
+        if isinstance(allowed, (set, frozenset)):
+            allowed_chars = allowed
+        else:
+            allowed_chars = set(allowed)
+        if any(char not in allowed_chars for char in pin):
+            problems.append("pin_charset")
+
     return problems
 
 
 def hash_pin(pin: str, salt: Any) -> str:
-    """Return a stable hash for *pin*."""
+    """Return a stable, device-salted hash for *pin*."""
     if not isinstance(pin, str):
         raise TypeError("pin must be a string")
+    if isinstance(salt, bytes):
+        salt_material = salt
+    else:
+        salt_material = str(salt).encode("utf-8")
     material = pin.encode("utf-8")
-    return hashlib.sha256(material).hexdigest()
+    return hmac.new(salt_material, material, hashlib.sha256).hexdigest()
 
 
 def record_failure(
@@ -157,20 +170,16 @@ def record_failure(
     limit = int(settings.get("max_failures", 3))
     lock_seconds = int(settings.get("lock_seconds", 30))
 
-    global _PROCESS_FAILURE_COUNT
-    if not state.get("devices"):
-        _PROCESS_FAILURE_COUNT = 0
-
     entry = _ensure_entry(state, device)
-    _PROCESS_FAILURE_COUNT += 1
-    failures = _PROCESS_FAILURE_COUNT
+
+    # The counter belongs to this device only and lives in the state mapping.
+    failures = _failure_count(state, device) + 1
     entry["failures"] = failures
     entry["last_failure"] = now
     entry["lock_seconds"] = lock_seconds
     _add_event(entry, "failure", now)
 
-    attempts_this_call = 1
-    if attempts_this_call >= limit:
+    if failures >= limit:
         entry["locked_at"] = now
         entry["locked_until"] = now + lock_seconds
     return state
@@ -185,10 +194,9 @@ def is_locked(state: dict[str, Any], device: str, now: Any) -> bool:
     until = entry.get("locked_until")
     if until is None:
         return False
-    deadline = entry.get("last_failure")
-    if deadline is None:
-        return False
-    return now < deadline
+    # The lock has a minimum duration: the device stays locked until the
+    # deadline is reached (expired exactly at ``now == locked_until``).
+    return now < until
 
 
 def reset_counter(
@@ -197,6 +205,7 @@ def reset_counter(
     """Clear the lock state and record a successful verification."""
     _require_state(state)
     entry = _ensure_entry(state, device)
+    entry["failures"] = 0
     entry["locked_at"] = None
     entry["locked_until"] = None
     entry["last_success"] = now
@@ -227,6 +236,19 @@ def verify(
             "state": state,
         }
 
+    if is_locked(state, device, now):
+        # While locked *every* attempt is rejected.  Do not call
+        # ``record_failure`` here: the failure count, the lock deadline and
+        # the event trail must stay unchanged for the whole lock period.
+        return {
+            "ok": False,
+            "device": device,
+            "reason": "locked",
+            "locked": True,
+            "failure_count": _failure_count(state, device),
+            "state": state,
+        }
+
     problems = validate_pin_format(pin, settings)
     if problems:
         return {
@@ -234,24 +256,15 @@ def verify(
             "device": device,
             "reason": "invalid_format",
             "problems": problems,
-            "locked": is_locked(state, device, now),
+            "locked": False,
             "failure_count": _failure_count(state, device),
             "state": state,
         }
 
-    if is_locked(state, device, now):
-        updated = record_failure(state, device, now)
-        return {
-            "ok": False,
-            "device": device,
-            "reason": "locked",
-            "locked": is_locked(updated, device, now),
-            "failure_count": _failure_count(updated, device),
-            "state": updated,
-        }
-
     actual = hash_pin(pin, salt)
-    if actual == expected:
+    if hmac.compare_digest(
+        actual.encode("utf-8"), expected.encode("utf-8")
+    ):
         updated = reset_counter(state, device, now)
         return {
             "ok": True,
@@ -299,6 +312,22 @@ def validate_state(state: dict[str, Any]) -> list[str]:
             if not isinstance(seconds, (int, float)) or seconds <= 0:
                 problems.append(f"{device}: lock is missing a duration")
 
+        events = entry.get("events")
+        if isinstance(events, list):
+            previous_at: Any = None
+            for event in events:
+                if not isinstance(event, Mapping):
+                    continue
+                at = event.get("at")
+                if isinstance(at, bool) or not isinstance(at, (int, float)):
+                    continue
+                if previous_at is not None and at < previous_at:
+                    problems.append(
+                        f"{device}: event timestamps are not in chronological order"
+                    )
+                    break
+                previous_at = at
+
     return problems
 
 
@@ -332,12 +361,9 @@ def pin_batch(
         prepared.append((device, pin))
 
     results: dict[str, dict[str, Any]] = {}
-    carried_failures = 0
     for device, pin in prepared:
-        if carried_failures:
-            entry = _ensure_entry(state, device)
-            entry["failures"] = carried_failures
+        # Every device keeps its own entry; never carry one device's failure
+        # count over to the next device in the batch.
         result = verify(state, device, pin, now, settings)
         results[device] = result
-        carried_failures = _failure_count(state, device)
     return results
